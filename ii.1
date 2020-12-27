@@ -25,6 +25,8 @@ and ii creates a new channel directory with in and out file.
 .IR servername ]
 .RB [ \-p
 .IR port ]
+.RB [ \-e
+.IR ssl ]
 .RB [ \-k
 .IR environment variable ]
 .RB [ \-i
@@ -41,6 +43,9 @@ lets you override the default servername (irc.freenode.net)
 .TP
 .BI \-p " port"
 lets you override the default port (6667)
+.TP
+.BI \-e " ssl"
+lets you connect using ssl encryption. The default ssl port is 6697.
 .TP
 .BI \-k " environment variable"
 lets you specify an environment variable that contains your IRC password, e.g. IIPASS="foobar" ii -k IIPASS.
