@@ -12,7 +12,7 @@ OBJ = $(SRC:.c=.o)
 
 # use system flags.
 II_CFLAGS = $(CFLAGS)
-II_LDFLAGS = $(LDFLAGS)
+II_LDFLAGS = $(LDFLAGS) -lssl -lcrypto
 
 # on systems which provide strlcpy(3),
 # remove NEED_STRLCPY from CPPFLAGS and

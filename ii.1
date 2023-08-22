@@ -7,6 +7,8 @@ ii - irc it or irc improved
 .I host
 .RB [ -p
 .I port
+.RB [ \-e
+.IR ssl ]
 |
 .B -u
 .IR sockname ]
@@ -39,6 +41,9 @@ server/host to connect to, for example: irc.freenode.net
 .TP
 .BI -p " port"
 lets you override the default port (6667)
+.TP
+.BI \-e " ssl"
+lets you connect using ssl encryption. The default ssl port is 6697.
 .TP
 .BI -u " sockname"
 connect to a UNIX domain socket instead of directly to a server.

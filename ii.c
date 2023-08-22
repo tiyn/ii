@@ -20,6 +20,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 char *argv0;
 
 #include "arg.h"
@@ -43,6 +47,14 @@ struct Channel {
 	Channel *next;
 };
 
+typedef struct {
+	int use_ssl;
+	int irc;
+	SSL *sslHandle;
+	SSL_CTX *sslContext;
+} conn;
+
+
 static Channel * channel_add(const char *);
 static Channel * channel_find(const char *);
 static Channel * channel_join(const char *);
@@ -57,21 +69,24 @@ static void      channel_rm(Channel *);
 static void      cleanup(void);
 static void      create_dirtree(const char *);
 static void      create_filepath(char *, size_t, const char *, const char *, const char *);
+static int       swrite(conn *, const char *, size_t);
+static void      ewritestr(conn *, const char *);
+static void      handle_channels_input(conn *, Channel *);
+static void      handle_server_output(conn *);
 static void      die(const char *, ...);
-static void      ewritestr(int, const char *);
-static void      handle_channels_input(int, Channel *);
-static void      handle_server_output(int);
 static int       isnumeric(const char *);
-static void      loginkey(int, const char *);
-static void      loginuser(int, const char *, const char *);
-static void      proc_channels_input(int, Channel *, char *);
-static void      proc_channels_privmsg(int, Channel *, char *);
-static void      proc_server_cmd(int, char *);
-static int       read_line(int, char *, size_t);
-static void      run(int, const char *);
+static void      loginkey(conn *, const char *);
+static void      loginuser(conn *, const char *, const char *);
+static void      proc_channels_input(conn *, Channel *, char *);
+static void      proc_channels_privmsg(conn *, Channel *, char *);
+static void      proc_server_cmd(conn *, char *);
+static int       sread(conn *, char *, size_t);
+static int       read_line(conn *, char *, size_t);
+static int       read_line_from_channel(int, char *, size_t);
+static void      run(conn *, const char *);
 static void      setup(void);
 static void      sighandler(int);
-static int       tcpopen(const char *, const char *);
+static void      tcpopen(conn *ircfd, const char *, const char *);
 static size_t    tokenize(char **, size_t, char *, int);
 static int       udsopen(const char *);
 static void      usage(void);
@@ -102,18 +117,27 @@ static void
 usage(void)
 {
 	die("usage: %s -s host [-p port | -u sockname] [-i ircdir]\n"
-	    "	[-n nickname] [-f fullname] [-k env_pass]\n", argv0);
+	    "	[-e <ssl>] [-n nickname] [-f fullname] [-k env_pass]\n", argv0);
+}
+
+static int
+swrite(conn *ircfd, const char *msg, size_t len)
+{
+	if (ircfd->use_ssl)
+		return SSL_write(ircfd->sslHandle, msg, len);
+
+	return write(ircfd->irc, msg, len);
 }
 
 static void
-ewritestr(int fd, const char *s)
+ewritestr(conn *fd, const char *s)
 {
 	size_t len, off = 0;
 	int w = -1;
 
 	len = strlen(s);
 	for (off = 0; off < len; off += w) {
-		if ((w = write(fd, s + off, len - off)) == -1)
+		if ((w = swrite(fd, s + off, len - off)) == -1)
 			break;
 	}
 	if (w == -1)
@@ -185,6 +209,7 @@ cleanup(void)
 		tmp = c->next;
 		channel_leave(c);
 	}
+
 }
 
 static void
@@ -341,14 +366,14 @@ channel_leave(Channel *c)
 }
 
 static void
-loginkey(int ircfd, const char *key)
+loginkey(conn *ircfd, const char *key)
 {
 	snprintf(msg, sizeof(msg), "PASS %s\r\n", key);
 	ewritestr(ircfd, msg);
 }
 
 static void
-loginuser(int ircfd, const char *host, const char *fullname)
+loginuser(conn *ircfd, const char *host, const char *fullname)
 {
 	snprintf(msg, sizeof(msg), "NICK %s\r\nUSER %s localhost %s :%s\r\n",
 	         nick, nick, host, fullname);
@@ -377,11 +402,14 @@ udsopen(const char *uds)
 	return fd;
 }
 
-static int
-tcpopen(const char *host, const char *service)
+static void
+tcpopen(conn *ircfd, const char *host, const char *service)
 {
 	struct addrinfo hints, *res = NULL, *rp;
 	int fd = -1, e;
+
+        ircfd->sslHandle = NULL;
+	ircfd->sslContext = NULL;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC; /* allow IPv4 or IPv6 */
@@ -407,7 +435,19 @@ tcpopen(const char *host, const char *service)
 			argv0, host, service, strerror(errno));
 
 	freeaddrinfo(res);
-	return fd;
+	ircfd->irc = fd;
+	if (!ircfd->use_ssl)
+		return;
+
+	//SSL_load_error_strings();
+	//SSL_library_init();
+	ircfd->sslContext = SSL_CTX_new(SSLv23_client_method());
+	if (ircfd->sslContext == NULL)
+		ERR_print_errors_fp(stderr);
+	ircfd->sslHandle = SSL_new(ircfd->sslContext);
+	if (!SSL_set_fd(ircfd->sslHandle, ircfd->irc) ||
+	    (SSL_connect(ircfd->sslHandle) != 1))
+		ERR_print_errors_fp(stderr);
 }
 
 static int
@@ -459,7 +499,7 @@ channel_print(Channel *c, const char *buf)
 }
 
 static void
-proc_channels_privmsg(int ircfd, Channel *c, char *buf)
+proc_channels_privmsg(conn *ircfd, Channel *c, char *buf)
 {
 	snprintf(msg, sizeof(msg), "<%s> %s", nick, buf);
 	channel_print(c, msg);
@@ -468,7 +508,7 @@ proc_channels_privmsg(int ircfd, Channel *c, char *buf)
 }
 
 static void
-proc_channels_input(int ircfd, Channel *c, char *buf)
+proc_channels_input(conn *ircfd, Channel *c, char *buf)
 {
 	char *p = NULL;
 	size_t buflen;
@@ -560,7 +600,7 @@ proc_channels_input(int ircfd, Channel *c, char *buf)
 }
 
 static void
-proc_server_cmd(int fd, char *buf)
+proc_server_cmd(conn *fd, char *buf)
 {
 	Channel *c;
 	const char *channel;
@@ -679,8 +719,33 @@ proc_server_cmd(int fd, char *buf)
 		channel_print(c, msg);
 }
 
+
 static int
-read_line(int fd, char *buf, size_t bufsiz)
+sread(conn *fd, char *buf, size_t bufsize)
+{
+	if (fd->use_ssl)
+		return SSL_read(fd->sslHandle, buf, bufsize);
+
+	return read(fd->irc, buf, bufsize);
+}
+
+static int
+read_line(conn *fd, char *buf, size_t bufsiz)
+{
+	size_t i = 0;
+	char c = '\0';
+
+	do {
+		if (sread(fd, &c, sizeof(char)) != sizeof(char))
+			return -1;
+		buf[i++] = c;
+	} while (c != '\n' && i < bufsiz);
+	buf[i - 1] = '\0'; /* eliminates '\n' */
+	return 0;
+}
+
+static int
+read_line_from_channel(int fd, char *buf, size_t bufsiz)
 {
 	size_t i = 0;
 	char c = '\0';
@@ -695,7 +760,7 @@ read_line(int fd, char *buf, size_t bufsiz)
 }
 
 static void
-handle_channels_input(int ircfd, Channel *c)
+handle_channels_input(conn *ircfd, Channel *c)
 {
 	/*
 	 * Do not allow to read this fully, since commands will be
@@ -706,7 +771,7 @@ handle_channels_input(int ircfd, Channel *c)
 	 */
 	char buf[IRC_MSG_MAX-64];
 
-	if (read_line(c->fdin, buf, sizeof(buf)) == -1) {
+	if (read_line_from_channel(c->fdin, buf, sizeof(buf)) == -1) {
 		if (channel_reopen(c) == -1)
 			channel_rm(c);
 		return;
@@ -715,7 +780,7 @@ handle_channels_input(int ircfd, Channel *c)
 }
 
 static void
-handle_server_output(int ircfd)
+handle_server_output(conn *ircfd)
 {
 	char buf[IRC_MSG_MAX];
 
@@ -746,7 +811,7 @@ setup(void)
 }
 
 static void
-run(int ircfd, const char *host)
+run(conn *ircfd, const char *host)
 {
 	Channel *c, *tmp;
 	fd_set rdset;
@@ -756,9 +821,9 @@ run(int ircfd, const char *host)
 
 	snprintf(ping_msg, sizeof(ping_msg), "PING %s\r\n", host);
 	while (isrunning) {
-		maxfd = ircfd;
+		maxfd = ircfd->irc;
 		FD_ZERO(&rdset);
-		FD_SET(ircfd, &rdset);
+		FD_SET(ircfd->irc, &rdset);
 		for (c = channels; c; c = c->next) {
 			if (c->fdin > maxfd)
 				maxfd = c->fdin;
@@ -780,7 +845,7 @@ run(int ircfd, const char *host)
 			ewritestr(ircfd, ping_msg);
 			continue;
 		}
-		if (FD_ISSET(ircfd, &rdset)) {
+		if (FD_ISSET(ircfd->irc, &rdset)) {
 			handle_server_output(ircfd);
 			last_response = time(NULL);
 		}
@@ -797,9 +862,12 @@ main(int argc, char *argv[])
 {
 	struct passwd *spw;
 	const char *key = NULL, *fullname = NULL, *host = "";
-	const char *uds = NULL, *service = "6667";
+	const char *uds = NULL;
+	const char *service = "6667";
+	const char *sservice = "6697";
 	char prefix[PATH_MAX];
-	int ircfd, r;
+	int r, defaultPort = 1;
+	conn ircfd;
 
 	/* use nickname and home dir of user by default */
 	if (!(spw = getpwuid(getuid())))
@@ -823,12 +891,18 @@ main(int argc, char *argv[])
 		break;
 	case 'p':
 		service = EARGF(usage());
+                defaultPort = 0;
 		break;
 	case 's':
 		host = EARGF(usage());
 		break;
 	case 'u':
 		uds = EARGF(usage());
+		break;
+	case 'e':
+		if (defaultPort)
+			service = sservice;
+		ircfd.use_ssl = 1;
 		break;
 	default:
 		usage();
@@ -839,9 +913,9 @@ main(int argc, char *argv[])
 		usage();
 
 	if (uds)
-		ircfd = udsopen(uds);
+		ircfd.irc = udsopen(uds);
 	else
-		ircfd = tcpopen(host, service);
+            tcpopen(&ircfd, host, service);
 
 #ifdef __OpenBSD__
 	/* OpenBSD pledge(2) support */
@@ -856,11 +930,19 @@ main(int argc, char *argv[])
 
 	channelmaster = channel_add(""); /* master channel */
 	if (key)
-		loginkey(ircfd, key);
-	loginuser(ircfd, host, fullname && *fullname ? fullname : nick);
+		loginkey(&ircfd, key);
+	loginuser(&ircfd, host, fullname && *fullname ? fullname : nick);
 	setup();
-	run(ircfd, host);
+	run(&ircfd, host);
 	cleanup();
+
+        if (ircfd.use_ssl) {
+		SSL_shutdown(ircfd.sslHandle);
+		SSL_free(ircfd.sslHandle);
+		SSL_CTX_free(ircfd.sslContext);
+	}
+
+	close(ircfd.irc);
 
 	return 0;
 }
