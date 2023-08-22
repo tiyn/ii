@@ -1,525 +1,866 @@
-/* (C)opyright MMV-MMVI Anselm R. Garbe <garbeam at gmail dot com>
- * (C)opyright MMV-MMXI Nico Golde <nico at ngolde dot de>
- * See LICENSE file for license details. */
-#include <errno.h>
-#include <netdb.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/socket.h>
+/* See LICENSE file for license details. */
 #include <sys/select.h>
-#include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <limits.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+
+#include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <string.h>
+#include <limits.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <pwd.h>
 #include <signal.h>
-#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <openssl/rand.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 
-#ifndef PIPE_BUF /* FreeBSD don't know PIPE_BUF */
-#define PIPE_BUF 4096
-#endif
-#define PING_TIMEOUT 300
-#define SERVER_PORT 6667
-#define SSL_SERVER_PORT 6697
-#define WRITE(con, mes, len) (use_ssl ? SSL_write(irc->sslHandle, mes, len) : write(con->irc, mes, len))
-#define READ(fd, buf, size) (from_server && use_ssl ? SSL_read(irc->sslHandle, buf, size) : read(fd, buf, size))
-typedef struct {
-	int irc;
-	SSL *sslHandle;
-	SSL_CTX *sslContext;
-} conn;
+char *argv0;
+
+#include "arg.h"
+
+#ifdef NEED_STRLCPY
+size_t strlcpy(char *, const char *, size_t);
+#endif /* NEED_STRLCPY */
+
+#define IRC_CHANNEL_MAX   200
+#define IRC_MSG_MAX       512 /* guaranteed to be <= than PIPE_BUF */
+#define PING_TIMEOUT      600
+
 enum { TOK_NICKSRV = 0, TOK_USER, TOK_CMD, TOK_CHAN, TOK_ARG, TOK_TEXT, TOK_LAST };
 
 typedef struct Channel Channel;
 struct Channel {
-	int fd;
-	char *name;
+	int fdin;
+	char name[IRC_CHANNEL_MAX]; /* channel name (normalized) */
+	char inpath[PATH_MAX];      /* input path */
+	char outpath[PATH_MAX];     /* output path */
 	Channel *next;
 };
 
-conn *irc;
-static int use_ssl;
-static time_t last_response;
+static Channel * channel_add(const char *);
+static Channel * channel_find(const char *);
+static Channel * channel_join(const char *);
+static void      channel_leave(Channel *);
+static Channel * channel_new(const char *);
+static void      channel_normalize_name(char *);
+static void      channel_normalize_path(char *);
+static int       channel_open(Channel *);
+static void      channel_print(Channel *, const char *);
+static int       channel_reopen(Channel *);
+static void      channel_rm(Channel *);
+static void      cleanup(void);
+static void      create_dirtree(const char *);
+static void      create_filepath(char *, size_t, const char *, const char *, const char *);
+static void      die(const char *, ...);
+static void      ewritestr(int, const char *);
+static void      handle_channels_input(int, Channel *);
+static void      handle_server_output(int);
+static int       isnumeric(const char *);
+static void      loginkey(int, const char *);
+static void      loginuser(int, const char *, const char *);
+static void      proc_channels_input(int, Channel *, char *);
+static void      proc_channels_privmsg(int, Channel *, char *);
+static void      proc_server_cmd(int, char *);
+static int       read_line(int, char *, size_t);
+static void      run(int, const char *);
+static void      setup(void);
+static void      sighandler(int);
+static int       tcpopen(const char *, const char *);
+static size_t    tokenize(char **, size_t, char *, int);
+static int       udsopen(const char *);
+static void      usage(void);
+
+static int      isrunning = 1;
+static time_t   last_response = 0;
 static Channel *channels = NULL;
-static char *host = "irc.freenode.net";
-static char nick[32];			/* might change while running */
-static char path[_POSIX_PATH_MAX];
-static char message[PIPE_BUF]; /* message buf used for communication */
+static Channel *channelmaster = NULL;
+static char     nick[32];          /* active nickname at runtime */
+static char     _nick[32];         /* nickname at startup */
+static char     ircpath[PATH_MAX]; /* irc dir (-i) */
+static char     msg[IRC_MSG_MAX];  /* message buf used for communication */
 
-static void usage() {
-	fputs("ii - irc it - " VERSION "\n"
-	      "(C)opyright MMV-MMVI Anselm R. Garbe\n"
-	      "(C)opyright MMV-MMXI Nico Golde\n"
-	      "usage: ii [-i <irc dir>] [-s <host>] [-p <port>] [-e ssl]\n"
-	      "          [-n <nick>] [-k <password>] [-f <fullname>]\n", stderr);
-	exit(EXIT_FAILURE);
+static void
+die(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+
+	cleanup();
+	exit(1);
 }
 
-static char *striplower(char *s) {
-	char *p = NULL;
-	for(p = s; p && *p; p++) {
-		if(*p == '/') *p = ',';
-		*p = tolower(*p);
+static void
+usage(void)
+{
+	die("usage: %s -s host [-p port | -u sockname] [-i ircdir]\n"
+	    "	[-n nickname] [-f fullname] [-k env_pass]\n", argv0);
+}
+
+static void
+ewritestr(int fd, const char *s)
+{
+	size_t len, off = 0;
+	int w = -1;
+
+	len = strlen(s);
+	for (off = 0; off < len; off += w) {
+		if ((w = write(fd, s + off, len - off)) == -1)
+			break;
 	}
-	return s;
+	if (w == -1)
+		die("%s: write: %s\n", argv0, strerror(errno));
 }
 
-/* creates directories top-down, if necessary */
-static void create_dirtree(const char *dir) {
-	char tmp[256];
-	char *p = NULL;
+/* creates directories bottom-up, if necessary */
+static void
+create_dirtree(const char *dir)
+{
+	char tmp[PATH_MAX], *p;
+	struct stat st;
 	size_t len;
-	snprintf(tmp, sizeof(tmp),"%s",dir);
+
+	strlcpy(tmp, dir, sizeof(tmp));
 	len = strlen(tmp);
-	if(tmp[len - 1] == '/')
-		tmp[len - 1] = 0;
-	for(p = tmp + 1; *p; p++)
-		if(*p == '/') {
-			*p = 0;
-			mkdir(tmp, S_IRWXU);
-			*p = '/';
-		}
+	if (len > 0 && tmp[len - 1] == '/')
+		tmp[len - 1] = '\0';
+
+	if ((stat(tmp, &st) != -1) && S_ISDIR(st.st_mode))
+		return; /* dir exists */
+
+	for (p = tmp + 1; *p; p++) {
+		if (*p != '/')
+			continue;
+		*p = '\0';
+		mkdir(tmp, S_IRWXU);
+		*p = '/';
+	}
 	mkdir(tmp, S_IRWXU);
 }
 
-static int get_filepath(char *filepath, size_t len, char *channel, char *file) {
-	if(channel) {
-		if(!snprintf(filepath, len, "%s/%s", path, channel))
-			return 0;
+static void
+channel_normalize_path(char *s)
+{
+	for (; *s; s++) {
+		if (isalpha((unsigned char)*s))
+			*s = tolower((unsigned char)*s);
+		else if (!isdigit((unsigned char)*s) && !strchr(".#&+!-", *s))
+			*s = '_';
+	}
+}
+
+static void
+channel_normalize_name(char *s)
+{
+	char *p;
+
+	while (*s == '&' || *s == '#')
+		s++;
+	for (p = s; *s; s++) {
+		if (!strchr(" ,&#\x07", *s)) {
+			*p = *s;
+			p++;
+		}
+	}
+	*p = '\0';
+}
+
+static void
+cleanup(void)
+{
+	Channel *c, *tmp;
+
+	if (channelmaster)
+		channel_leave(channelmaster);
+
+	for (c = channels; c; c = tmp) {
+		tmp = c->next;
+		channel_leave(c);
+	}
+}
+
+static void
+create_filepath(char *filepath, size_t len, const char *path,
+	const char *channel, const char *suffix)
+{
+	int r;
+
+	if (channel[0]) {
+		r = snprintf(filepath, len, "%s/%s", path, channel);
+		if (r < 0 || (size_t)r >= len)
+			goto error;
 		create_dirtree(filepath);
-		return snprintf(filepath, len, "%s/%s/%s", path, channel, file);
+		r = snprintf(filepath, len, "%s/%s/%s", path, channel, suffix);
+		if (r < 0 || (size_t)r >= len)
+			goto error;
+	} else {
+		r = snprintf(filepath, len, "%s/%s", path, suffix);
+		if (r < 0 || (size_t)r >= len)
+			goto error;
 	}
-	return snprintf(filepath, len, "%s/%s", path, file);
+	return;
+
+error:
+	die("%s: path to irc directory too long\n", argv0);
 }
 
-static void create_filepath(char *filepath, size_t len, char *channel, char *suffix) {
-	if(!get_filepath(filepath, len, striplower(channel), suffix)) {
-		fputs("ii: path to irc directory too long\n", stderr);
-		exit(EXIT_FAILURE);
-	}
-}
-
-static int open_channel(char *name) {
-	static char infile[256];
-	create_filepath(infile, sizeof(infile), name, "in");
-	if(access(infile, F_OK) == -1)
-		mkfifo(infile, S_IRWXU);
-	return open(infile, O_RDONLY | O_NONBLOCK, 0);
-}
-
-static void add_channel(char *cname) {
-	Channel *c;
+static int
+channel_open(Channel *c)
+{
 	int fd;
-	char *name = striplower(cname);
+	struct stat st;
 
-	for(c = channels; c; c = c->next)
-		if(!strcmp(name, c->name))
-			return; /* already handled */
+	/* make "in" fifo if it doesn't exist already. */
+	if (lstat(c->inpath, &st) != -1) {
+		if (!(st.st_mode & S_IFIFO))
+			return -1;
+	} else if (mkfifo(c->inpath, S_IRWXU)) {
+		return -1;
+	}
+	c->fdin = -1;
+	fd = open(c->inpath, O_RDONLY | O_NONBLOCK, 0);
+	if (fd == -1)
+		return -1;
+	c->fdin = fd;
 
-	fd = open_channel(name);
-	if(fd == -1) {
-		printf("ii: exiting, cannot create in channel: %s\n", name);
-		exit(EXIT_FAILURE);
+	return 0;
+}
+
+static int
+channel_reopen(Channel *c)
+{
+	if (c->fdin > 2) {
+		close(c->fdin);
+		c->fdin = -1;
 	}
-	c = calloc(1, sizeof(Channel));
-	if(!c) {
-		perror("ii: cannot allocate memory");
-		exit(EXIT_FAILURE);
+	return channel_open(c);
+}
+
+static Channel *
+channel_new(const char *name)
+{
+	Channel *c;
+	char channelpath[PATH_MAX];
+
+	strlcpy(channelpath, name, sizeof(channelpath));
+	channel_normalize_path(channelpath);
+
+	if (!(c = calloc(1, sizeof(Channel))))
+		die("%s: calloc: %s\n", argv0, strerror(errno));
+
+	strlcpy(c->name, name, sizeof(c->name));
+	channel_normalize_name(c->name);
+
+	create_filepath(c->inpath, sizeof(c->inpath), ircpath,
+	                channelpath, "in");
+	create_filepath(c->outpath, sizeof(c->outpath), ircpath,
+	                channelpath, "out");
+	return c;
+}
+
+static Channel *
+channel_find(const char *name)
+{
+	Channel *c;
+	char chan[IRC_CHANNEL_MAX];
+
+	strlcpy(chan, name, sizeof(chan));
+	channel_normalize_name(chan);
+	for (c = channels; c; c = c->next) {
+		if (!strcmp(chan, c->name))
+			return c; /* already handled */
 	}
-	if(!channels) channels = c;
-	else {
+	return NULL;
+}
+
+static Channel *
+channel_add(const char *name)
+{
+	Channel *c;
+
+	c = channel_new(name);
+	if (channel_open(c) == -1) {
+		fprintf(stderr, "%s: cannot create channel: %s: %s\n",
+		         argv0, name, strerror(errno));
+		free(c);
+		return NULL;
+	}
+	if (!channels) {
+		channels = c;
+	} else {
 		c->next = channels;
 		channels = c;
-	}
-	c->fd = fd;
-	c->name = strdup(name);
-}
-
-static void rm_channel(Channel *c) {
-	Channel *p;
-	if(channels == c) channels = channels->next;
-	else {
-		for(p = channels; p && p->next != c; p = p->next);
-		if(p->next == c)
-			p->next = c->next;
-	}
-	free(c->name);
-	free(c);
-}
-
-static void login(char *key, char *fullname) {
-	if(key) snprintf(message, PIPE_BUF,
-				"PASS %s\r\nNICK %s\r\nUSER %s localhost %s :%s\r\n", key,
-				nick, nick, host, fullname ? fullname : nick);
-	else snprintf(message, PIPE_BUF, "NICK %s\r\nUSER %s localhost %s :%s\r\n",
-				nick, nick, host, fullname ? fullname : nick);
-	WRITE(irc, message, strlen(message));	/* login */
-}
-
-conn *tcpopen(unsigned short port) {
-	int fd;
-    conn *c;
-	struct sockaddr_in sin;
-	struct hostent *hp = gethostbyname(host);
-
-	memset(&sin, 0, sizeof(struct sockaddr_in));
-	if(!hp) {
-		perror("ii: cannot retrieve host information");
-		exit(EXIT_FAILURE);
-	}
-	sin.sin_family = AF_INET;
-	memcpy(&sin.sin_addr, hp->h_addr, hp->h_length);
-	sin.sin_port = htons(port);
-	if((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-		perror("ii: cannot create socket");
-		exit(EXIT_FAILURE);
-	}
-	if(connect(fd, (const struct sockaddr *) &sin, sizeof(sin)) < 0) {
-		perror("ii: cannot connect to host");
-		exit(EXIT_FAILURE);
-	}
-	c = malloc(sizeof(conn));
-	c->irc = fd;
-	if(use_ssl) {
-		c->sslHandle = NULL;
-		c->sslContext = NULL;
-		SSL_load_error_strings();
-		SSL_library_init();
-		c->sslContext = SSL_CTX_new(SSLv23_client_method());
-		if(c->sslContext == NULL)
-			ERR_print_errors_fp(stderr);
-		c->sslHandle = SSL_new(c->sslContext);
-		if(!SSL_set_fd(c->sslHandle, c->irc)
-				|| (SSL_connect(c->sslHandle) != 1))
-			ERR_print_errors_fp(stderr);
 	}
 	return c;
 }
 
-static size_t tokenize(char **result, size_t reslen, char *str, char delim) {
-	char *p = NULL, *n = NULL;
-	size_t i;
+static Channel *
+channel_join(const char *name)
+{
+	Channel *c;
 
-	if(!str)
-		return 0;
-	for(n = str; *n == ' '; n++);
+	if (!(c = channel_find(name)))
+		c = channel_add(name);
+	return c;
+}
+
+static void
+channel_rm(Channel *c)
+{
+	Channel *p;
+
+	if (channels == c) {
+		channels = channels->next;
+	} else {
+		for (p = channels; p && p->next != c; p = p->next)
+			;
+		if (p && p->next == c)
+			p->next = c->next;
+	}
+	free(c);
+}
+
+static void
+channel_leave(Channel *c)
+{
+	if (c->fdin > 2) {
+		close(c->fdin);
+		c->fdin = -1;
+	}
+	/* remove "in" file on leaving the channel */
+	unlink(c->inpath);
+	channel_rm(c);
+}
+
+static void
+loginkey(int ircfd, const char *key)
+{
+	snprintf(msg, sizeof(msg), "PASS %s\r\n", key);
+	ewritestr(ircfd, msg);
+}
+
+static void
+loginuser(int ircfd, const char *host, const char *fullname)
+{
+	snprintf(msg, sizeof(msg), "NICK %s\r\nUSER %s localhost %s :%s\r\n",
+	         nick, nick, host, fullname);
+	puts(msg);
+	ewritestr(ircfd, msg);
+}
+
+static int
+udsopen(const char *uds)
+{
+	struct sockaddr_un sun;
+	size_t len;
+	int fd;
+
+	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+		die("%s: socket: %s\n", argv0, strerror(errno));
+
+	sun.sun_family = AF_UNIX;
+	if (strlcpy(sun.sun_path, uds, sizeof(sun.sun_path)) >= sizeof(sun.sun_path))
+		die("%s: UNIX domain socket path truncation\n", argv0);
+
+	len = strlen(sun.sun_path) + 1 + sizeof(sun.sun_family);
+	if (connect(fd, (struct sockaddr *)&sun, len) == -1)
+		die("%s: connect: %s\n", argv0, strerror(errno));
+
+	return fd;
+}
+
+static int
+tcpopen(const char *host, const char *service)
+{
+	struct addrinfo hints, *res = NULL, *rp;
+	int fd = -1, e;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC; /* allow IPv4 or IPv6 */
+	hints.ai_flags = AI_NUMERICSERV; /* avoid name lookup for port */
+	hints.ai_socktype = SOCK_STREAM;
+
+	if ((e = getaddrinfo(host, service, &hints, &res)))
+		die("%s: getaddrinfo: %s\n", argv0, gai_strerror(e));
+
+	for (rp = res; rp; rp = rp->ai_next) {
+		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+		if (fd == -1)
+			continue;
+		if (connect(fd, rp->ai_addr, rp->ai_addrlen) == -1) {
+			close(fd);
+			fd = -1;
+			continue;
+		}
+		break; /* success */
+	}
+	if (fd == -1)
+		die("%s: could not connect to %s:%s: %s\n",
+			argv0, host, service, strerror(errno));
+
+	freeaddrinfo(res);
+	return fd;
+}
+
+static int
+isnumeric(const char *s)
+{
+	errno = 0;
+	strtol(s, NULL, 10);
+	return errno == 0;
+}
+
+static size_t
+tokenize(char **result, size_t reslen, char *str, int delim)
+{
+	char *p = NULL, *n = NULL;
+	size_t i = 0;
+
+	for (n = str; *n == ' '; n++)
+		;
 	p = n;
-	for(i = 0; *n != 0;) {
-		if(i == reslen)
+	while (*n != '\0') {
+		if (i >= reslen)
 			return 0;
-		if(i > TOK_CHAN - TOK_CMD && strtol(result[0], NULL, 10) > 0) delim=':'; /* workaround non-RFC compliant messages */
-		if(*n == delim) {
-			*n = 0;
+		if (i > TOK_CHAN - TOK_CMD && result[0] && isnumeric(result[0]))
+			delim = ':'; /* workaround non-RFC compliant messages */
+		if (*n == delim) {
+			*n = '\0';
 			result[i++] = p;
 			p = ++n;
-		} else
+		} else {
 			n++;
+		}
 	}
-	if(i<reslen && p < n && strlen(p))
+	/* add last entry */
+	if (i < reslen && p < n && p && *p)
 		result[i++] = p;
-	return i;				/* number of tokens */
+	return i; /* number of tokens */
 }
 
-static void print_out(char *channel, char *buf) {
-	static char outfile[256], server[256], buft[18];
-	FILE *out = NULL;
-	time_t t = time(0);
+static void
+channel_print(Channel *c, const char *buf)
+{
+	FILE *fp = NULL;
+	time_t t = time(NULL);
 
-	if(channel) snprintf(server, sizeof(server), "-!- %s", channel);
-	if(strstr(buf, server)) channel="";
-	create_filepath(outfile, sizeof(outfile), channel, "out");
-	if(!(out = fopen(outfile, "a"))) return;
-	if(channel && channel[0]) add_channel(channel);
-
-	strftime(buft, sizeof(buft), "%F %R", localtime(&t));
-	fprintf(out, "%s %s\n", buft, buf);
-	fclose(out);
+	if (!(fp = fopen(c->outpath, "a")))
+		return;
+	fprintf(fp, "%lu %s\n", (unsigned long)t, buf);
+	fclose(fp);
 }
 
-static void proc_channels_privmsg(char *channel, char *buf) {
-	snprintf(message, PIPE_BUF, "<%s> %s", nick, buf);
-	print_out(channel, message);
-	snprintf(message, PIPE_BUF, "PRIVMSG %s :%s\r\n", channel, buf);
-	WRITE(irc, message, strlen(message));
+static void
+proc_channels_privmsg(int ircfd, Channel *c, char *buf)
+{
+	snprintf(msg, sizeof(msg), "<%s> %s", nick, buf);
+	channel_print(c, msg);
+	snprintf(msg, sizeof(msg), "PRIVMSG %s :%s\r\n", c->name, buf);
+	ewritestr(ircfd, msg);
 }
 
-static void proc_channels_input(Channel *c, char *buf) {
-	/* static char infile[256]; */
+static void
+proc_channels_input(int ircfd, Channel *c, char *buf)
+{
 	char *p = NULL;
+	size_t buflen;
 
-	if(buf[0] != '/' && buf[0] != 0) {
-		proc_channels_privmsg(c->name, buf);
+	if (buf[0] == '\0')
+		return;
+	if (buf[0] != '/') {
+		proc_channels_privmsg(ircfd, c, buf);
 		return;
 	}
-	message[0] = '\0';
-	if(buf[2] == ' ' || buf[2] == '\0') switch (buf[1]) {
-		case 'j':
-			p = strchr(&buf[3], ' ');
-			if(p) *p = 0;
-			if((buf[3]=='#')||(buf[3]=='&')||(buf[3]=='+')||(buf[3]=='!')){
-				if(p) snprintf(message, PIPE_BUF, "JOIN %s %s\r\n", &buf[3], p + 1); /* password protected channel */
-				else snprintf(message, PIPE_BUF, "JOIN %s\r\n", &buf[3]);
-				add_channel(&buf[3]);
-			}
-			else if(p){
-				add_channel(&buf[3]);
-				proc_channels_privmsg(&buf[3], p + 1);
+
+	msg[0] = '\0';
+	if ((buflen = strlen(buf)) < 2)
+		return;
+	if (buf[2] == ' ' || buf[2] == '\0') {
+		switch (buf[1]) {
+		case 'j': /* join */
+			if (buflen < 3)
+				return;
+			if ((p = strchr(&buf[3], ' '))) /* password parameter */
+				*p = '\0';
+			if ((buf[3] == '#') || (buf[3] == '&') || (buf[3] == '+') ||
+				(buf[3] == '!'))
+			{
+				/* password protected channel */
+				if (p)
+					snprintf(msg, sizeof(msg), "JOIN %s %s\r\n", &buf[3], p + 1);
+				else
+					snprintf(msg, sizeof(msg), "JOIN %s\r\n", &buf[3]);
+				channel_join(&buf[3]);
+			} else if (p) {
+				if ((c = channel_join(&buf[3])))
+					proc_channels_privmsg(ircfd, c, p + 1);
 				return;
 			}
 			break;
-		case 't':
-			if(strlen(buf)>=3) snprintf(message, PIPE_BUF, "TOPIC %s :%s\r\n", c->name, &buf[3]);
+		case 't': /* topic */
+			if (buflen >= 3)
+				snprintf(msg, sizeof(msg), "TOPIC %s :%s\r\n", c->name, &buf[3]);
 			break;
-		case 'a':
-			if(strlen(buf)>=3){
-				snprintf(message, PIPE_BUF, "-!- %s is away \"%s\"", nick, &buf[3]);
-				print_out(c->name, message);
+		case 'a': /* away */
+			if (buflen >= 3) {
+				snprintf(msg, sizeof(msg), "-!- %s is away \"%s\"", nick, &buf[3]);
+				channel_print(c, msg);
 			}
-			if(buf[2] == 0 || strlen(buf)<3) /* or used to make else part safe */
-				snprintf(message, PIPE_BUF, "AWAY\r\n");
+			if (buflen >= 3)
+				snprintf(msg, sizeof(msg), "AWAY :%s\r\n", &buf[3]);
 			else
-				snprintf(message, PIPE_BUF, "AWAY :%s\r\n", &buf[3]);
+				snprintf(msg, sizeof(msg), "AWAY\r\n");
 			break;
-		case 'n':
-			if(strlen(buf)>=3){
-				snprintf(nick, sizeof(nick),"%s", &buf[3]);
-				snprintf(message, PIPE_BUF, "NICK %s\r\n", &buf[3]);
+		case 'n': /* change nick */
+			if (buflen >= 3) {
+				strlcpy(_nick, &buf[3], sizeof(_nick));
+				snprintf(msg, sizeof(msg), "NICK %s\r\n", &buf[3]);
 			}
 			break;
-		case 'l':
-			if(c->name[0] == 0)
+		case 'l': /* leave */
+			if (c == channelmaster)
 				return;
-			if(buf[2] == ' ' && strlen(buf)>=3)
-				snprintf(message, PIPE_BUF, "PART %s :%s\r\n", c->name, &buf[3]);
+			if (buflen >= 3)
+				snprintf(msg, sizeof(msg), "PART %s :%s\r\n", c->name, &buf[3]);
 			else
-				snprintf(message, PIPE_BUF,
-						"PART %s :ii - 500 SLOC are too much\r\n", c->name);
-			WRITE(irc, message, strlen(message));
-			close(c->fd);
-			/*create_filepath(infile, sizeof(infile), c->name, "in");
-			unlink(infile); */
-			rm_channel(c);
+				snprintf(msg, sizeof(msg),
+				         "PART %s :leaving\r\n", c->name);
+			ewritestr(ircfd, msg);
+			channel_leave(c);
 			return;
 			break;
-		default:
-			snprintf(message, PIPE_BUF, "%s\r\n", &buf[1]);
+		case 'q': /* quit */
+			if (buflen >= 3)
+				snprintf(msg, sizeof(msg), "QUIT :%s\r\n", &buf[3]);
+			else
+				snprintf(msg, sizeof(msg),
+				         "QUIT %s\r\n", "bye");
+			ewritestr(ircfd, msg);
+			isrunning = 0;
+			return;
+			break;
+		default: /* raw IRC command */
+			snprintf(msg, sizeof(msg), "%s\r\n", &buf[1]);
 			break;
 		}
-	else
-		snprintf(message, PIPE_BUF, "%s\r\n", &buf[1]);
-
-	if (message[0] != '\0')
-		WRITE(irc, message, strlen(message));
+	} else {
+		/* raw IRC command */
+		snprintf(msg, sizeof(msg), "%s\r\n", &buf[1]);
+	}
+	if (msg[0] != '\0')
+		ewritestr(ircfd, msg);
 }
 
-static void proc_server_cmd(char *buf) {
+static void
+proc_server_cmd(int fd, char *buf)
+{
+	Channel *c;
+	const char *channel;
 	char *argv[TOK_LAST], *cmd = NULL, *p = NULL;
-	int i;
+	unsigned int i;
 
-	if(!buf || *buf=='\0')
+	if (!buf || buf[0] == '\0')
 		return;
 
-	for(i = 0; i < TOK_LAST; i++)
+	/* clear tokens */
+	for (i = 0; i < TOK_LAST; i++)
 		argv[i] = NULL;
-	/* <message>  ::= [':' <prefix> <SPACE> ] <command> <params> <crlf>
-	   <prefix>   ::= <servername> | <nick> [ '!' <user> ] [ '@' <host> ]
-	   <command>  ::= <letter> { <letter> } | <number> <number> <number>
-	   <SPACE>    ::= ' ' { ' ' }
-	   <params>   ::= <SPACE> [ ':' <trailing> | <middle> <params> ]
-	   <middle>   ::= <Any *non-empty* sequence of octets not including SPACE
-	   or NUL or CR or LF, the first of which may not be ':'>
-	   <trailing> ::= <Any, possibly *empty*, sequence of octets not including NUL or CR or LF>
-	   <crlf>     ::= CR LF */
 
-	if(buf[0] == ':') {		/* check prefix */
-		if (!(p = strchr(buf, ' '))) return;
-		*p = 0;
-		for(++p; *p == ' '; p++);
+	/* check prefix */
+	if (buf[0] == ':') {
+		if (!(p = strchr(buf, ' ')))
+			return;
+		*p = '\0';
+		for (++p; *p == ' '; p++)
+			;
 		cmd = p;
 		argv[TOK_NICKSRV] = &buf[1];
-		if((p = strchr(buf, '!'))) {
-			*p = 0;
+		if ((p = strchr(buf, '!'))) {
+			*p = '\0';
 			argv[TOK_USER] = ++p;
 		}
-	} else
+	} else {
 		cmd = buf;
+	}
 
 	/* remove CRLFs */
-	for(p = cmd; p && *p != 0; p++)
-		if(*p == '\r' || *p == '\n')
-			*p = 0;
+	for (p = cmd; p && *p != '\0'; p++) {
+		if (*p == '\r' || *p == '\n')
+			*p = '\0';
+	}
 
-	if((p = strchr(cmd, ':'))) {
-		*p = 0;
+	if ((p = strchr(cmd, ':'))) {
+		*p = '\0';
 		argv[TOK_TEXT] = ++p;
 	}
 
 	tokenize(&argv[TOK_CMD], TOK_LAST - TOK_CMD, cmd, ' ');
 
-	if(!argv[TOK_CMD] || !strncmp("PONG", argv[TOK_CMD], 5)) {
+	if (!argv[TOK_CMD] || !strcmp("PONG", argv[TOK_CMD])) {
 		return;
-	} else if(!strncmp("PING", argv[TOK_CMD], 5)) {
-		snprintf(message, PIPE_BUF, "PONG %s\r\n", argv[TOK_TEXT]);
-		WRITE(irc, message, strlen(message));
+	} else if (!strcmp("PING", argv[TOK_CMD])) {
+		snprintf(msg, sizeof(msg), "PONG %s\r\n", argv[TOK_TEXT]);
+		ewritestr(fd, msg);
 		return;
-	} else if(!argv[TOK_NICKSRV] || !argv[TOK_USER]) {	/* server command */
-		snprintf(message, PIPE_BUF, "%s%s", argv[TOK_ARG] ? argv[TOK_ARG] : "", argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
-		print_out(0, message);
-		return;
-	} else if(!strncmp("ERROR", argv[TOK_CMD], 6))
-		snprintf(message, PIPE_BUF, "-!- error %s", argv[TOK_TEXT] ? argv[TOK_TEXT] : "unknown");
-	else if(!strncmp("JOIN", argv[TOK_CMD], 5)) {
-		if (argv[TOK_TEXT] != NULL)
+	} else if (!argv[TOK_NICKSRV] || !argv[TOK_USER]) {
+		/* server command */
+		snprintf(msg, sizeof(msg), "%s%s",
+				argv[TOK_ARG] ? argv[TOK_ARG] : "",
+				argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
+		channel_print(channelmaster, msg);
+		return; /* don't process further */
+	} else if (!strcmp("ERROR", argv[TOK_CMD]))
+		snprintf(msg, sizeof(msg), "-!- error %s",
+				argv[TOK_TEXT] ? argv[TOK_TEXT] : "unknown");
+	else if (!strcmp("JOIN", argv[TOK_CMD]) && (argv[TOK_CHAN] || argv[TOK_TEXT])) {
+		if (argv[TOK_TEXT])
 			argv[TOK_CHAN] = argv[TOK_TEXT];
-		snprintf(message, PIPE_BUF, "-!- %s(%s) has joined %s", argv[TOK_NICKSRV], argv[TOK_USER], argv[TOK_CHAN]);
-	} else if(!strncmp("PART", argv[TOK_CMD], 5)) {
-		snprintf(message, PIPE_BUF, "-!- %s(%s) has left %s", argv[TOK_NICKSRV], argv[TOK_USER], argv[TOK_CHAN]);
-	} else if(!strncmp("MODE", argv[TOK_CMD], 5))
-		snprintf(message, PIPE_BUF, "-!- %s changed mode/%s -> %s %s", argv[TOK_NICKSRV], argv[TOK_CMD + 1] ? argv[TOK_CMD + 1] : "" , argv[TOK_CMD + 2]? argv[TOK_CMD + 2] : "", argv[TOK_CMD + 3] ? argv[TOK_CMD + 3] : "");
-	else if(!strncmp("QUIT", argv[TOK_CMD], 5))
-		snprintf(message, PIPE_BUF, "-!- %s(%s) has quit \"%s\"", argv[TOK_NICKSRV], argv[TOK_USER], argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
-	else if(!strncmp("NICK", argv[TOK_CMD], 5))
-		snprintf(message, PIPE_BUF, "-!- %s changed nick to %s", argv[TOK_NICKSRV], argv[TOK_TEXT]);
-	else if(!strncmp("TOPIC", argv[TOK_CMD], 6))
-		snprintf(message, PIPE_BUF, "-!- %s changed topic to \"%s\"", argv[TOK_NICKSRV], argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
-	else if(!strncmp("KICK", argv[TOK_CMD], 5))
-		snprintf(message, PIPE_BUF, "-!- %s kicked %s (\"%s\")", argv[TOK_NICKSRV], argv[TOK_ARG], argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
-	else if(!strncmp("NOTICE", argv[TOK_CMD], 7))
-		snprintf(message, PIPE_BUF, "-!- \"%s\")", argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
-	else if(!strncmp("PRIVMSG", argv[TOK_CMD], 8))
-		snprintf(message, PIPE_BUF, "<%s> %s", argv[TOK_NICKSRV], argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
-	if(!argv[TOK_CHAN] || !strncmp(argv[TOK_CHAN], nick, strlen(nick)))
-		print_out(argv[TOK_NICKSRV], message);
+		snprintf(msg, sizeof(msg), "-!- %s(%s) has joined %s",
+				argv[TOK_NICKSRV], argv[TOK_USER], argv[TOK_CHAN]);
+	} else if (!strcmp("PART", argv[TOK_CMD]) && argv[TOK_CHAN]) {
+		snprintf(msg, sizeof(msg), "-!- %s(%s) has left %s",
+				argv[TOK_NICKSRV], argv[TOK_USER], argv[TOK_CHAN]);
+		/* if user itself leaves, don't write to channel (don't reopen channel). */
+		if (!strcmp(argv[TOK_NICKSRV], nick))
+			return;
+	} else if (!strcmp("MODE", argv[TOK_CMD])) {
+		snprintf(msg, sizeof(msg), "-!- %s changed mode/%s -> %s %s",
+				argv[TOK_NICKSRV],
+				argv[TOK_CHAN] ? argv[TOK_CHAN] : "",
+				argv[TOK_ARG]  ? argv[TOK_ARG] : "",
+				argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
+	} else if (!strcmp("QUIT", argv[TOK_CMD])) {
+		snprintf(msg, sizeof(msg), "-!- %s(%s) has quit \"%s\"",
+				argv[TOK_NICKSRV], argv[TOK_USER],
+				argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
+	} else if (!strncmp("NICK", argv[TOK_CMD], 5) && argv[TOK_TEXT] &&
+	          !strcmp(_nick, argv[TOK_TEXT])) {
+		strlcpy(nick, _nick, sizeof(nick));
+		snprintf(msg, sizeof(msg), "-!- changed nick to \"%s\"", nick);
+		channel_print(channelmaster, msg);
+	} else if (!strcmp("NICK", argv[TOK_CMD]) && argv[TOK_TEXT]) {
+		snprintf(msg, sizeof(msg), "-!- %s changed nick to %s",
+				argv[TOK_NICKSRV], argv[TOK_TEXT]);
+	} else if (!strcmp("TOPIC", argv[TOK_CMD])) {
+		snprintf(msg, sizeof(msg), "-!- %s changed topic to \"%s\"",
+				argv[TOK_NICKSRV],
+				argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
+	} else if (!strcmp("KICK", argv[TOK_CMD]) && argv[TOK_ARG]) {
+		snprintf(msg, sizeof(msg), "-!- %s kicked %s (\"%s\")",
+				argv[TOK_NICKSRV], argv[TOK_ARG],
+				argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
+	} else if (!strcmp("NOTICE", argv[TOK_CMD])) {
+		snprintf(msg, sizeof(msg), "-!- \"%s\"",
+				argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
+	} else if (!strcmp("PRIVMSG", argv[TOK_CMD])) {
+		snprintf(msg, sizeof(msg), "<%s> %s", argv[TOK_NICKSRV],
+				argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
+	} else {
+		return; /* can't read this message */
+	}
+	if (argv[TOK_CHAN] && !strcmp(argv[TOK_CHAN], nick))
+		channel = argv[TOK_NICKSRV];
 	else
-		print_out(argv[TOK_CHAN], message);
+		channel = argv[TOK_CHAN];
+
+	if (!channel || channel[0] == '\0')
+		c = channelmaster;
+	else
+		c = channel_join(channel);
+	if (c)
+		channel_print(c, msg);
 }
 
-static int read_line(int fd, size_t res_len, char *buf, int from_server) {
+static int
+read_line(int fd, char *buf, size_t bufsiz)
+{
 	size_t i = 0;
-	char c = 0;
+	char c = '\0';
+
 	do {
-		if(READ(fd, &c, sizeof(char)) != sizeof(char))
+		if (read(fd, &c, sizeof(char)) != sizeof(char))
 			return -1;
 		buf[i++] = c;
-	}
-	while(c != '\n' && i < res_len);
-	buf[i - 1] = 0;			/* eliminates '\n' */
+	} while (c != '\n' && i < bufsiz);
+	buf[i - 1] = '\0'; /* eliminates '\n' */
 	return 0;
 }
 
-static void handle_channels_input(Channel *c) {
-	static char buf[PIPE_BUF];
-	if(read_line(c->fd, PIPE_BUF, buf, 0) == -1) {
-		close(c->fd);
-		int fd = open_channel(c->name);
-		if(fd != -1)
-			c->fd = fd;
-		else
-			rm_channel(c);
+static void
+handle_channels_input(int ircfd, Channel *c)
+{
+	/*
+	 * Do not allow to read this fully, since commands will be
+	 * prepended. It will result in too long lines sent to the
+	 * server.
+	 * TODO: Make this depend on the maximum metadata given by the
+	 * server at the beginning of the connection.
+	 */
+	char buf[IRC_MSG_MAX-64];
+
+	if (read_line(c->fdin, buf, sizeof(buf)) == -1) {
+		if (channel_reopen(c) == -1)
+			channel_rm(c);
 		return;
 	}
-	proc_channels_input(c, buf);
+	proc_channels_input(ircfd, c, buf);
 }
 
-static void handle_server_output() {
-	static char buf[PIPE_BUF];
-	if(read_line(irc->irc, PIPE_BUF, buf, 1) == -1) {
-		perror("ii: remote host closed connection");
-		exit(EXIT_FAILURE);
-	}
-	proc_server_cmd(buf);
+static void
+handle_server_output(int ircfd)
+{
+	char buf[IRC_MSG_MAX];
+
+	if (read_line(ircfd, buf, sizeof(buf)) == -1)
+		die("%s: remote host closed connection: %s\n", argv0, strerror(errno));
+
+	fprintf(stdout, "%lu %s\n", (unsigned long)time(NULL), buf);
+	fflush(stdout);
+	proc_server_cmd(ircfd, buf);
 }
 
-static void run() {
-	Channel *c;
-	int r, maxfd;
-	fd_set rd;
+static void
+sighandler(int sig)
+{
+	if (sig == SIGTERM || sig == SIGINT)
+		isrunning = 0;
+}
+
+static void
+setup(void)
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sighandler;
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+}
+
+static void
+run(int ircfd, const char *host)
+{
+	Channel *c, *tmp;
+	fd_set rdset;
 	struct timeval tv;
-	char ping_msg[512];
+	char ping_msg[IRC_MSG_MAX];
+	int r, maxfd;
 
 	snprintf(ping_msg, sizeof(ping_msg), "PING %s\r\n", host);
-	for(;;) {
-		FD_ZERO(&rd);
-		maxfd = irc->irc;
-		FD_SET(irc->irc, &rd);
-		for(c = channels; c; c = c->next) {
-			if(maxfd < c->fd)
-				maxfd = c->fd;
-			FD_SET(c->fd, &rd);
+	while (isrunning) {
+		maxfd = ircfd;
+		FD_ZERO(&rdset);
+		FD_SET(ircfd, &rdset);
+		for (c = channels; c; c = c->next) {
+			if (c->fdin > maxfd)
+				maxfd = c->fdin;
+			FD_SET(c->fdin, &rdset);
 		}
-
+		memset(&tv, 0, sizeof(tv));
 		tv.tv_sec = 120;
-		tv.tv_usec = 0;
-		r = select(maxfd + 1, &rd, 0, 0, &tv);
-		if(r < 0) {
-			if(errno == EINTR)
+		r = select(maxfd + 1, &rdset, 0, 0, &tv);
+		if (r < 0) {
+			if (errno == EINTR)
 				continue;
-			perror("ii: error on select()");
-			exit(EXIT_FAILURE);
-		} else if(r == 0) {
-			if(time(NULL) - last_response >= PING_TIMEOUT) {
-				print_out(NULL, "-!- ii shutting down: ping timeout");
-				exit(EXIT_FAILURE);
+			die("%s: select: %s\n", argv0, strerror(errno));
+		} else if (r == 0) {
+			if (time(NULL) - last_response >= PING_TIMEOUT) {
+				channel_print(channelmaster, "-!- ii shutting down: ping timeout");
+				cleanup();
+				exit(2); /* status code 2 for timeout */
 			}
-			WRITE(irc, ping_msg, strlen(ping_msg));
+			ewritestr(ircfd, ping_msg);
 			continue;
 		}
-		if(FD_ISSET(irc->irc, &rd)) {
-			handle_server_output();
+		if (FD_ISSET(ircfd, &rdset)) {
+			handle_server_output(ircfd);
 			last_response = time(NULL);
 		}
-		for(c = channels; c; c = c->next)
-			if(FD_ISSET(c->fd, &rd))
-				handle_channels_input(c);
+		for (c = channels; c; c = tmp) {
+			tmp = c->next;
+			if (FD_ISSET(c->fdin, &rdset))
+				handle_channels_input(ircfd, c);
+		}
 	}
 }
 
-int main(int argc, char *argv[]) {
-	int i;
-	unsigned short port = SERVER_PORT;
-	struct passwd *spw = getpwuid(getuid());
-	char *key = NULL, *fullname = NULL;
-	char prefix[_POSIX_PATH_MAX];
+int
+main(int argc, char *argv[])
+{
+	struct passwd *spw;
+	const char *key = NULL, *fullname = NULL, *host = "";
+	const char *uds = NULL, *service = "6667";
+	char prefix[PATH_MAX];
+	int ircfd, r;
 
-	if(!spw) {
-		fputs("ii: getpwuid() failed\n", stderr);
-		exit(EXIT_FAILURE);
-	}
-	snprintf(nick, sizeof(nick), "%s", spw->pw_name);
-	snprintf(prefix, sizeof(prefix),"%s/irc", spw->pw_dir);
-	if (argc <= 1 || (argc == 2 && argv[1][0] == '-' && argv[1][1] == 'h')) usage();
+	/* use nickname and home dir of user by default */
+	if (!(spw = getpwuid(getuid())))
+		die("%s: getpwuid: %s\n", argv0, strerror(errno));
 
-	for(i = 1; (i + 1 < argc) && (argv[i][0] == '-'); i++) {
-		switch (argv[i][1]) {
-			case 'i': snprintf(prefix,sizeof(prefix),"%s", argv[++i]); break;
-			case 's': host = argv[++i]; break;
-			case 'p': port = strtol(argv[++i], NULL, 10); break;
-			case 'n': snprintf(nick,sizeof(nick),"%s", argv[++i]); break;
-			case 'k': key = getenv(argv[++i]); break;
-			case 'e': use_ssl = 1; ++i; break;
-			case 'f': fullname = argv[++i]; break;
-			default: usage(); break;
-		}
-	}
-	if(use_ssl)
-		port = port == SERVER_PORT ? SSL_SERVER_PORT : port;
-	irc = tcpopen(port);
-	if(!snprintf(path, sizeof(path), "%s/%s", prefix, host)) {
-		fputs("ii: path to irc directory too long\n", stderr);
-		exit(EXIT_FAILURE);
-	}
-	create_dirtree(path);
+	strlcpy(nick, spw->pw_name, sizeof(nick));
+	snprintf(prefix, sizeof(prefix), "%s/irc", spw->pw_dir);
 
-	add_channel(""); /* master channel */
-	login(key, fullname);
-	run();
+	ARGBEGIN {
+	case 'f':
+		fullname = EARGF(usage());
+		break;
+	case 'i':
+		strlcpy(prefix, EARGF(usage()), sizeof(prefix));
+		break;
+	case 'k':
+		key = getenv(EARGF(usage()));
+		break;
+	case 'n':
+		strlcpy(nick, EARGF(usage()), sizeof(nick));
+		break;
+	case 'p':
+		service = EARGF(usage());
+		break;
+	case 's':
+		host = EARGF(usage());
+		break;
+	case 'u':
+		uds = EARGF(usage());
+		break;
+	default:
+		usage();
+		break;
+	} ARGEND
 
-	return EXIT_SUCCESS;
+	if (!*host)
+		usage();
+
+	if (uds)
+		ircfd = udsopen(uds);
+	else
+		ircfd = tcpopen(host, service);
+
+#ifdef __OpenBSD__
+	/* OpenBSD pledge(2) support */
+	if (pledge("stdio rpath wpath cpath dpath", NULL) == -1)
+		die("%s: pledge: %s\n", argv0, strerror(errno));
+#endif
+
+	r = snprintf(ircpath, sizeof(ircpath), "%s/%s", prefix, host);
+	if (r < 0 || (size_t)r >= sizeof(ircpath))
+		die("%s: path to irc directory too long\n", argv0);
+	create_dirtree(ircpath);
+
+	channelmaster = channel_add(""); /* master channel */
+	if (key)
+		loginkey(ircfd, key);
+	loginuser(ircfd, host, fullname && *fullname ? fullname : nick);
+	setup();
+	run(ircfd, host);
+	cleanup();
+
+	return 0;
 }
